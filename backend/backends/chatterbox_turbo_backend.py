@@ -48,6 +48,12 @@ class ChatterboxTurboTTSBackend:
         self.model_size = "default"
         self._device = None
         self._model_load_lock = asyncio.Lock()
+        # Cache the (expensive) reference conditioning per seed clip so it is
+        # computed once per voice and reused across calls. chatterbox recomputes
+        # it every time you pass audio_prompt_path, which is the dominant
+        # per-call latency (~4-5s). Keyed by (path, mtime) so a re-seed busts it.
+        self._conds_cache: dict = {}
+        self._gen_lock = threading.Lock()  # serialize conds-swap + generate (shared model.conds)
 
     def _get_device(self) -> str:
         return get_torch_device(force_cpu_on_mac=True, allow_xpu=True)
@@ -176,31 +182,58 @@ class ChatterboxTurboTTSBackend:
             logger.warning(f"Reference audio not found: {ref_audio}")
             ref_audio = None
 
+        # Cache key busts if the seed file is replaced (re-seed) at the same path.
+        conds_key = None
+        if ref_audio is not None:
+            try:
+                conds_key = (ref_audio, Path(ref_audio).stat().st_mtime)
+            except OSError:
+                conds_key = (ref_audio, None)
+
         def _generate_sync():
             import torch
 
-            if seed is not None:
-                manual_seed(seed, self._device)
+            # The model has a single shared self.conds slot, so prepare/swap +
+            # generate must be atomic across concurrent requests (e.g. different
+            # girls sharing this backend).
+            with self._gen_lock:
+                if seed is not None:
+                    manual_seed(seed, self._device)
 
-            logger.info("[Chatterbox Turbo] Generating (English)")
+                if conds_key is not None:
+                    cached = self._conds_cache.get(conds_key)
+                    if cached is None:
+                        # Same params generate() uses when handed audio_prompt_path
+                        # (exaggeration/cfg are ignored by Turbo) -> identical voice.
+                        self.model.prepare_conditionals(
+                            ref_audio, exaggeration=0.0, norm_loudness=True
+                        )
+                        self._conds_cache[conds_key] = self.model.conds
+                        logger.info("[Chatterbox Turbo] Cached conditionals for %s", ref_audio)
+                    else:
+                        self.model.conds = cached
+                elif self.model.conds is None:
+                    raise RuntimeError(
+                        "Chatterbox Turbo: no reference audio and no cached conditionals"
+                    )
 
-            wav = self.model.generate(
-                text,
-                audio_prompt_path=ref_audio,
-                temperature=0.8,
-                top_k=1000,
-                top_p=0.95,
-                repetition_penalty=1.2,
-            )
+                logger.info("[Chatterbox Turbo] Generating (English, cached conds)")
+                wav = self.model.generate(
+                    text,
+                    audio_prompt_path=None,  # reuse self.conds — skip the re-encode
+                    temperature=0.8,
+                    top_k=1000,
+                    top_p=0.95,
+                    repetition_penalty=1.2,
+                )
 
-            # Convert tensor -> numpy
-            if isinstance(wav, torch.Tensor):
-                audio = wav.squeeze().cpu().numpy().astype(np.float32)
-            else:
-                audio = np.asarray(wav, dtype=np.float32)
+                # Convert tensor -> numpy
+                if isinstance(wav, torch.Tensor):
+                    audio = wav.squeeze().cpu().numpy().astype(np.float32)
+                else:
+                    audio = np.asarray(wav, dtype=np.float32)
 
-            sample_rate = getattr(self.model, "sr", None) or getattr(self.model, "sample_rate", 24000)
-
-            return audio, sample_rate
+                sample_rate = getattr(self.model, "sr", None) or getattr(self.model, "sample_rate", 24000)
+                return audio, sample_rate
 
         return await asyncio.to_thread(_generate_sync)
