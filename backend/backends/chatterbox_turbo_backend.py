@@ -152,6 +152,38 @@ class ChatterboxTurboTTSBackend:
     ) -> Tuple[np.ndarray, str]:
         return await _combine_voice_prompts(audio_paths, reference_texts)
 
+    def _load_or_prepare_conds(self, ref_audio: str):
+        """Return voice conditioning for a seed clip: load it from disk if a
+        fresh copy exists, else prepare it once and persist it next to the seed
+        (``<seed>.conds.pt``, keyed by seed mtime so a re-seed recomputes).
+        Makes conditioning permanent per voice — computed once ever, surviving
+        restarts (preparing it is the dominant per-call cost)."""
+        from chatterbox.tts_turbo import Conditionals
+
+        conds_path = Path(ref_audio).with_suffix(".conds.pt")
+        try:
+            if (conds_path.exists()
+                    and conds_path.stat().st_mtime >= Path(ref_audio).stat().st_mtime):
+                conds = Conditionals.load(conds_path, map_location=self._device or "cpu")
+                logger.info("[Chatterbox Turbo] Loaded persisted conditionals: %s", conds_path)
+                return conds
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[Chatterbox Turbo] Could not load persisted conds %s (%s); recomputing",
+                conds_path, e,
+            )
+
+        # Prepare fresh (sets self.model.conds); same params generate() uses when
+        # handed audio_prompt_path (exaggeration/cfg ignored by Turbo) -> identical voice.
+        self.model.prepare_conditionals(ref_audio, exaggeration=0.0, norm_loudness=True)
+        conds = self.model.conds
+        try:
+            conds.save(conds_path)
+            logger.info("[Chatterbox Turbo] Prepared + persisted conditionals: %s", conds_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Chatterbox Turbo] Could not persist conds to %s: %s", conds_path, e)
+        return conds
+
     async def generate(
         self,
         text: str,
@@ -203,15 +235,9 @@ class ChatterboxTurboTTSBackend:
                 if conds_key is not None:
                     cached = self._conds_cache.get(conds_key)
                     if cached is None:
-                        # Same params generate() uses when handed audio_prompt_path
-                        # (exaggeration/cfg are ignored by Turbo) -> identical voice.
-                        self.model.prepare_conditionals(
-                            ref_audio, exaggeration=0.0, norm_loudness=True
-                        )
-                        self._conds_cache[conds_key] = self.model.conds
-                        logger.info("[Chatterbox Turbo] Cached conditionals for %s", ref_audio)
-                    else:
-                        self.model.conds = cached
+                        cached = self._load_or_prepare_conds(ref_audio)
+                        self._conds_cache[conds_key] = cached
+                    self.model.conds = cached
                 elif self.model.conds is None:
                     raise RuntimeError(
                         "Chatterbox Turbo: no reference audio and no cached conditionals"
