@@ -346,7 +346,31 @@ async def _run_startup(application: FastAPI) -> None:
     except Exception as e:
         logger.warning("Could not create HuggingFace cache directory: %s", e)
 
+    # Optional model pre-warm: load the configured TTS engine model(s) at boot in
+    # the background so the FIRST generation doesn't pay the one-time ~20s model
+    # load. Env-gated (comma-separated engine names in VOICEBOX_PREWARM) so the
+    # upstream default behaviour is unchanged when it's unset.
+    import os
+
+    _prewarm = os.getenv("VOICEBOX_PREWARM", "").strip()
+    if _prewarm:
+        _engines = [e.strip() for e in _prewarm.split(",") if e.strip()]
+        create_background_task(_prewarm_engines(_engines))
+
     logger.info("Ready")
+
+
+async def _prewarm_engines(engines: list[str]) -> None:
+    """Load TTS engine models in the background at startup (see VOICEBOX_PREWARM)."""
+    from .backends import load_engine_model
+
+    for engine in engines:
+        try:
+            logger.info("Pre-warming TTS engine model: %s", engine)
+            await load_engine_model(engine)
+            logger.info("Pre-warm complete: %s", engine)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Pre-warm failed for %s: %s", engine, e)
 
 
 async def _run_shutdown() -> None:
