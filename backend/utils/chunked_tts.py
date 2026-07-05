@@ -21,6 +21,17 @@ logger = logging.getLogger("voicebox.chunked-tts")
 # the ``max_chunk_chars`` field on GenerationRequest.
 DEFAULT_MAX_CHUNK_CHARS = 800
 
+# Never render a tiny fragment as its own chunk: very short text gives the
+# AR model almost no anchor, and prompt-replay leaks (the model continuing
+# its voice-conditioning clip instead of the text) concentrate there.
+# Short chunks are merged into their neighbour before rendering.
+MIN_CHUNK_CHARS = 40
+
+# Temperature for per-chunk renders (single-shot renders keep the engine
+# default).  Chunked long replies roll the prompt-replay dice once per
+# chunk, so they run cooler to keep generation anchored to the text.
+CHUNKED_TEMPERATURE = 0.6
+
 # Common abbreviations that should NOT be treated as sentence endings.
 # Lowercase for case-insensitive matching.
 _ABBREVIATIONS = frozenset(
@@ -101,7 +112,18 @@ def split_text_into_chunks(text: str, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) 
             chunks.append(chunk)
         remaining = remaining[split_pos + 1 :]
 
-    return chunks
+    # Merge runt chunks into a neighbour (forward, then a backward pass for
+    # a short tail) so no fragment under MIN_CHUNK_CHARS renders alone.
+    merged: List[str] = []
+    for c in chunks:
+        if merged and len(merged[-1]) < MIN_CHUNK_CHARS:
+            merged[-1] = f"{merged[-1]} {c}"
+        else:
+            merged.append(c)
+    if len(merged) > 1 and len(merged[-1]) < MIN_CHUNK_CHARS:
+        merged[-1] = f"{merged[-2]} {merged[-1]}"
+        del merged[-2]
+    return merged
 
 
 def _find_last_sentence_end(text: str) -> int:
@@ -269,6 +291,15 @@ async def generate_chunked(
     audio_chunks: List[np.ndarray] = []
     sample_rate: int | None = None
 
+    # Engine-agnostic wrapper, but engines that expose a temperature knob
+    # get the cooler chunked setting (see CHUNKED_TEMPERATURE above).
+    import inspect
+    _extra: dict = (
+        {"temperature": CHUNKED_TEMPERATURE}
+        if "temperature" in inspect.signature(backend.generate).parameters
+        else {}
+    )
+
     for i, chunk_text in enumerate(chunks):
         logger.info(
             "Generating chunk %d/%d (%d chars)",
@@ -287,6 +318,7 @@ async def generate_chunked(
             language,
             chunk_seed,
             instruct,
+            **_extra,
         )
         if trim_fn is not None:
             chunk_audio = trim_fn(chunk_audio, chunk_sr)

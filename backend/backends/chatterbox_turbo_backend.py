@@ -192,6 +192,7 @@ class ChatterboxTurboTTSBackend:
         language: str = "en",
         seed: Optional[int] = None,
         instruct: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> Tuple[np.ndarray, int]:
         """
         Generate audio using Chatterbox Turbo TTS.
@@ -258,7 +259,7 @@ class ChatterboxTurboTTSBackend:
                 wav = self.model.generate(
                     text,
                     audio_prompt_path=None,  # reuse self.conds — skip the re-encode
-                    temperature=0.8,
+                    temperature=temperature if temperature is not None else 0.8,
                     top_k=1000,
                     top_p=0.95,
                     repetition_penalty=1.2,
