@@ -53,6 +53,7 @@ class ChatterboxTurboTTSBackend:
         # it every time you pass audio_prompt_path, which is the dominant
         # per-call latency (~4-5s). Keyed by (path, mtime) so a re-seed busts it.
         self._conds_cache: dict = {}
+        self._active_conds_key = None  # which voice currently holds the GPU floor
         self._gen_lock = threading.Lock()  # serialize conds-swap + generate (shared model.conds)
 
     def _get_device(self) -> str:
@@ -237,6 +238,16 @@ class ChatterboxTurboTTSBackend:
                     if cached is None:
                         cached = self._load_or_prepare_conds(ref_audio)
                         self._conds_cache[conds_key] = cached
+                    if conds_key != self._active_conds_key:
+                        # Voice handover: return the previous voice's scratch pool
+                        # (fragmented allocator blocks left by her renders) to the
+                        # GPU so the incoming voice carves fresh contiguous space.
+                        # Small-VRAM accommodation: on 4GB cards those shards are
+                        # what starve long renders (OOM with free-but-fragmented
+                        # memory). Costs one re-carve on the first turn only.
+                        if self._active_conds_key is not None and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        self._active_conds_key = conds_key
                     self.model.conds = cached
                 elif self.model.conds is None:
                     raise RuntimeError(
